@@ -24,8 +24,11 @@ export function useAssets(query: AssetQuery) {
   });
 
   useEffect(() => {
+    const controller = new AbortController();
+    const {signal} = controller;
+
     setState((s) => ({ ...s, loading: true, error: null }));
-    listAssets(query)
+    listAssets(query, signal)
       .then((page) => {
         setState({
           items: page.items,
@@ -36,12 +39,20 @@ export function useAssets(query: AssetQuery) {
         });
       })
       .catch((err: unknown) => {
+        if (signal.aborted || (err instanceof Error && err.name === "AbortError")) {
+          return;
+        }
         setState((s) => ({
           ...s,
           loading: false,
           error: err instanceof Error ? err.message : 'Something went wrong',
         }));
       });
+
+
+      return () => {
+        controller.abort();
+      }
   }, [JSON.stringify(query)]);
 
   return state;

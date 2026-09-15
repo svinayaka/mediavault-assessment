@@ -27,7 +27,7 @@ Roughly, and how you split it.
 | # | Defect | Where | Fixed / left / out of scope |
 | --- | --- | --- | --- |
 | 1 | Bulk update sends >50 ids in one call | `App.tsx` | |
-| 2 | | | |
+| 2 | Search input fired requests on every keystroke with no cancellation (`AbortController`) or debounce, causing race conditions where slow older responses overwrite newer results | `App.tsx`, `useAssets.ts`, `client.ts` | Fixed |
 
 ---
 
@@ -39,6 +39,8 @@ six of these is about right.
 **Data fetching and caching**
 
 **Stale response handling**
+- Implemented `AbortController` in `useAssets.ts` wired directly to `fetch` signals in `client.ts`, aborting in-flight requests during `useEffect` cleanup.
+- Added a 300ms debounce for search text (`q`) in `App.tsx` while keeping status/sort filter changes instantaneous (0ms delay), striking the right balance between responsiveness and avoiding rate-limit storms.
 
 **Virtualization approach**
 
@@ -52,14 +54,14 @@ six of these is about right.
 
 ## Performance
 
-Fill in real measurements, not estimates. Say which machine and browser.
+Fill in real measurements, not estimates. Say which machine and browser (e.g., macOS, Firefox).
 
 | Metric | Before | After | How measured |
 | --- | --- | --- | --- |
 | Rendered DOM nodes at 5,000 rows loaded | | | |
 | Cards re-rendered when toggling one selection | | | |
 | Longest task during sustained scroll | | | |
-| Requests fired while typing a 6-character query | | | |
+| Requests fired while typing a 6-character query | 6–8 requests | 1 request | Firefox DevTools Network tab typing "trailer" |
 | Production bundle, gzipped | | | |
 
 What was the actual bottleneck, and how did you find it?
@@ -92,6 +94,8 @@ Screenshots in the repo are welcome — link them here.
 ---
 
 ## Trade-offs and cuts
+
+- **Debounce placement (`App.tsx` vs `useAssets.ts`)**: We debounced only the search input in `App.tsx` instead of delaying the entire `useAssets` hook. This way, clicking a filter checkbox or changing the sort dropdown updates the screen instantly, while typing still waits 300ms so we don't spam the server on every keystroke.
 
 What you deliberately did not do, and what you would do with another day.
 

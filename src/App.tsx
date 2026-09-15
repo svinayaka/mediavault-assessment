@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useState, useEffect } from 'react';
 import { bulkSetStatus } from '@/api/client';
 import { AssetDetail } from '@/features/assets/AssetDetail';
 import { AssetGrid } from '@/features/assets/AssetGrid';
@@ -16,14 +16,27 @@ const SORTS: Array<{ value: NonNullable<AssetQuery['sort']>; label: string }> = 
 
 export function App() {
   const [q, setQ] = useState('');
+  const [debouncedQ, setDebouncedQ] = useState(q);
   const [status, setStatus] = useState<AssetStatus[]>([]);
   const [sort, setSort] = useState<NonNullable<AssetQuery['sort']>>('updatedAt:desc');
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
   const [activeId, setActiveId] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
 
+  useEffect(() => {
+    const timer = setTimeout(() => {
+      setDebouncedQ(q);
+    }, 300); // 300ms debounce interval
+    return () => clearTimeout(timer);
+  }, [q]);
+
   // Every keystroke sends a request. Nothing is debounced or cancelled.
-  const { items, total, loading, error } = useAssets({ q, status, sort, limit: 24 });
+  const { items, total, loading, error } = useAssets({ 
+    q: debouncedQ,
+    status,
+    sort,
+    limit: 24
+  });
 
   function toggleSelect(id: string) {
     setSelectedIds((prev) => {
