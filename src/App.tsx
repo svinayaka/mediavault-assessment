@@ -14,11 +14,20 @@ const SORTS: Array<{ value: NonNullable<AssetQuery['sort']>; label: string }> = 
   { value: 'createdAt:desc', label: 'Newest' },
 ];
 
+function getInitialParams() {
+  const params = new URLSearchParams(window.location.search);
+  const q = params.get('q') ?? '';
+  const status = (params.get('status')?.split(',').filter(Boolean) as AssetStatus[]) ?? [];
+  const sort = (params.get('sort') as NonNullable<AssetQuery['sort']>) ?? 'updatedAt:desc';
+  return { q, status, sort };
+}
+
 export function App() {
-  const [q, setQ] = useState('');
-  const [debouncedQ, setDebouncedQ] = useState(q);
-  const [status, setStatus] = useState<AssetStatus[]>([]);
-  const [sort, setSort] = useState<NonNullable<AssetQuery['sort']>>('updatedAt:desc');
+  const initial = getInitialParams();
+  const [q, setQ] = useState(initial.q);
+  const [debouncedQ, setDebouncedQ] = useState(initial.q);
+  const [status, setStatus] = useState<AssetStatus[]>(initial.status);
+  const [sort, setSort] = useState<NonNullable<AssetQuery['sort']>>(initial.sort);
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
   const [activeId, setActiveId] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
@@ -30,8 +39,19 @@ export function App() {
     return () => clearTimeout(timer);
   }, [q]);
 
+  useEffect(() => {
+    const params = new URLSearchParams();
+    if (debouncedQ) params.set('q', debouncedQ);
+    if (status.length > 0) params.set('status', status.join(','));
+    if (sort !== 'updatedAt:desc') params.set('sort', sort);
+    const qs = params.toString();
+    const newUrl = qs ? `?${qs}` : window.location.pathname;
+    // Use replaceState so typing doesn't create dozens of history entries
+    window.history.replaceState(null, '', newUrl);
+  }, [debouncedQ, sort, status]);
+
   // Every keystroke sends a request. Nothing is debounced or cancelled.
-  const { items, total, loading, error } = useAssets({ 
+  const { items, total, loading, error } = useAssets({
     q: debouncedQ,
     status,
     sort,

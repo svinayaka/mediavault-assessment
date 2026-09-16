@@ -28,6 +28,7 @@ Roughly, and how you split it.
 | --- | --- | --- | --- |
 | 1 | Bulk update sends >50 ids in one call | `App.tsx` | |
 | 2 | Search input fired requests on every keystroke with no cancellation (`AbortController`) or debounce, causing race conditions where slow older responses overwrite newer results | `App.tsx`, `useAssets.ts`, `client.ts` | Fixed |
+| 3 | State was not synchronized to URL, losing search/filter state on page reload and lacking deep-linking | `App.tsx` | Fixed |
 
 ---
 
@@ -49,6 +50,8 @@ six of these is about right.
 **Retry and backoff policy**
 
 **State placement and URL sync**
+- Initialized state from URL query parameters via `getInitialParams()` on mount (`q`, `status`, `sort`).
+- Used `window.history.replaceState` synchronized with the debounced query state so that active views are shareable, deep-linkable, and persist across page refreshes without cluttering the browser history with an entry for every keystroke.
 
 ---
 
