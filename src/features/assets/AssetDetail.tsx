@@ -15,7 +15,7 @@ interface Props {
  * Baseline detail panel. Loads on open, saves with no optimistic update,
  * surfaces failures as raw strings, and does nothing about focus.
  */
-export function AssetDetail({ id, onClose, onSaved }: Props) {
+export function AssetDetail({ id, onClose, onSaved }: Readonly<Props>) {
   const [asset, setAsset] = useState<Asset | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);

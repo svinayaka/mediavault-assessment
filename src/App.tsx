@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useCallback } from 'react';
 import { bulkSetStatus } from '@/api/client';
 import { AssetDetail } from '@/features/assets/AssetDetail';
 import { AssetGrid } from '@/features/assets/AssetGrid';
@@ -57,23 +57,24 @@ export function App() {
     window.history.replaceState(null, '', newUrl);
   }, [debouncedQ, sort, status, kind, tag]);
 
-  const { items, total, loading, error } = useAssets({
-    q: debouncedQ,
-    status,
-    kind,
-    tag,
-    sort,
-    limit: 24,
-  });
+  const { items, total, loading, loadingMore, error, loadMoreError, hasMore, loadMore } =
+    useAssets({
+      q: debouncedQ,
+      status,
+      kind,
+      tag,
+      sort,
+      limit: 24,
+    });
 
-  function toggleSelect(id: string) {
+  const toggleSelect = useCallback((id: string) => {
     setSelectedIds((prev) => {
       const next = new Set(prev);
       if (next.has(id)) next.delete(id);
       else next.add(id);
       return next;
     });
-  }
+  }, []);
 
   async function applyBulkStatus(next: AssetStatus) {
     const ids = [...selectedIds];
@@ -166,11 +167,15 @@ export function App() {
         <AssetGrid
           assets={items}
           loading={loading}
+          loadingMore={loadingMore}
           error={error}
+          loadMoreError={loadMoreError}
+          hasMore={hasMore}
           selectedIds={selectedIds}
           activeId={activeId}
           onToggleSelect={toggleSelect}
           onOpen={setActiveId}
+          onLoadMore={loadMore}
         />
         {activeId && (
           <AssetDetail id={activeId} onClose={() => setActiveId(null)} onSaved={handleSaved} />
