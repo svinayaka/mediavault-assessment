@@ -11,6 +11,24 @@ import type { Asset, AssetPage, AssetQuery, BulkResult } from '@/lib/types';
  *   - callers cannot distinguish "retry this" from "do not retry this"
  */
 
+const inFlight = new Map<string, Promise<unknown>>();
+
+function requestKey(path: string, init?: RequestInit): string | null {
+  const method = (init?.method ?? 'GET').toUpperCase();
+  if (method !== 'GET') return null; // Only dedupe idempotent GET requests
+  return `${method} ${path}`;
+}
+
+function dedupe<T>(key: string, fn: () => Promise<T>): Promise<T> {
+  const existing = inFlight.get(key) as Promise<T> | undefined;
+  if (existing) return existing;
+  const promise = fn().finally(() => {
+    inFlight.delete(key);
+  });
+  inFlight.set(key, promise);
+  return promise;
+}
+
 function toSearchParams(query: AssetQuery): string {
   const params = new URLSearchParams();
   if (query.q) params.set('q', query.q);
@@ -26,21 +44,50 @@ function toSearchParams(query: AssetQuery): string {
 }
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
-  const res = await fetch(path, {
-    ...init,
-    headers: { 'content-type': 'application/json', ...(init?.headers ?? {}) },
-  });
-  if (!res.ok) {
-    let detail = res.statusText;
-    try {
-      const body = await res.json();
-      detail = body?.error?.message ?? detail;
-    } catch {
-      /* response was not JSON */
+  const callerSignal = init?.signal;
+  const { signal: _, ...fetchInit } = init ?? {};
+
+  const performFetch = async () => {
+    const res = await fetch(path, {
+      ...fetchInit,
+      headers: { 'content-type': 'application/json', ...(fetchInit.headers ?? {}) },
+    });
+    if (!res.ok) {
+      let detail = res.statusText;
+      try {
+        const body = await res.json();
+        detail = body?.error?.message ?? detail;
+      } catch {
+        /* response was not JSON */
+      }
+      throw new Error(`${res.status}: ${detail}`);
     }
-    throw new Error(`${res.status}: ${detail}`);
+    return res.json() as Promise<T>;
+  };
+
+  const key = requestKey(path, init);
+  const promise = key ? dedupe(key, performFetch) : performFetch();
+
+  if (!callerSignal) {
+    return promise;
   }
-  return res.json() as Promise<T>;
+
+  return new Promise<T>((resolve, reject) => {
+    if (callerSignal.aborted) {
+      return reject(new DOMException('Aborted', 'AbortError'));
+    }
+    const onAbort = () => reject(new DOMException('Aborted', 'AbortError'));
+    callerSignal.addEventListener('abort', onAbort, { once: true });
+    promise
+      .then((val) => {
+        callerSignal.removeEventListener('abort', onAbort);
+        resolve(val);
+      })
+      .catch((err) => {
+        callerSignal.removeEventListener('abort', onAbort);
+        reject(err);
+      });
+  });
 }
 
 export function listAssets(query: AssetQuery, signal?: AbortSignal): Promise<AssetPage> {

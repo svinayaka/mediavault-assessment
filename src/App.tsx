@@ -4,9 +4,10 @@ import { AssetDetail } from '@/features/assets/AssetDetail';
 import { AssetGrid } from '@/features/assets/AssetGrid';
 import { useAssets } from '@/features/assets/useAssets';
 import { statusLabel } from '@/lib/format';
-import type { Asset, AssetStatus, AssetQuery } from '@/lib/types';
+import type { Asset, AssetStatus, AssetKind, AssetQuery } from '@/lib/types';
 
 const STATUSES: AssetStatus[] = ['draft', 'in_review', 'approved', 'archived'];
+const KINDS: AssetKind[] = ['image', 'video', 'document'];
 const SORTS: Array<{ value: NonNullable<AssetQuery['sort']>; label: string }> = [
   { value: 'updatedAt:desc', label: 'Recently updated' },
   { value: 'name:asc', label: 'Name A–Z' },
@@ -18,8 +19,10 @@ function getInitialParams() {
   const params = new URLSearchParams(window.location.search);
   const q = params.get('q') ?? '';
   const status = (params.get('status')?.split(',').filter(Boolean) as AssetStatus[]) ?? [];
+  const kind = (params.get('kind')?.split(',').filter(Boolean) as AssetKind[]) ?? [];
+  const tag = params.get('tag')?.split(',').filter(Boolean) ?? [];
   const sort = (params.get('sort') as NonNullable<AssetQuery['sort']>) ?? 'updatedAt:desc';
-  return { q, status, sort };
+  return { q, status, kind, tag, sort };
 }
 
 export function App() {
@@ -27,6 +30,8 @@ export function App() {
   const [q, setQ] = useState(initial.q);
   const [debouncedQ, setDebouncedQ] = useState(initial.q);
   const [status, setStatus] = useState<AssetStatus[]>(initial.status);
+  const [kind, setKind] = useState<AssetKind[]>(initial.kind);
+  const [tag] = useState<string[]>(initial.tag);
   const [sort, setSort] = useState<NonNullable<AssetQuery['sort']>>(initial.sort);
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
   const [activeId, setActiveId] = useState<string | null>(null);
@@ -43,19 +48,22 @@ export function App() {
     const params = new URLSearchParams();
     if (debouncedQ) params.set('q', debouncedQ);
     if (status.length > 0) params.set('status', status.join(','));
+    if (kind.length > 0) params.set('kind', kind.join(','));
+    if (tag.length > 0) params.set('tag', tag.join(','));
     if (sort !== 'updatedAt:desc') params.set('sort', sort);
     const qs = params.toString();
     const newUrl = qs ? `?${qs}` : window.location.pathname;
     // Use replaceState so typing doesn't create dozens of history entries
     window.history.replaceState(null, '', newUrl);
-  }, [debouncedQ, sort, status]);
+  }, [debouncedQ, sort, status, kind, tag]);
 
-  // Every keystroke sends a request. Nothing is debounced or cancelled.
   const { items, total, loading, error } = useAssets({
     q: debouncedQ,
     status,
+    kind,
+    tag,
     sort,
-    limit: 24
+    limit: 24,
   });
 
   function toggleSelect(id: string) {
@@ -120,6 +128,20 @@ export function App() {
             {statusLabel(s)}
           </label>
         ))}
+        {KINDS.map((k) => (
+          <label key={k}>
+            <input
+              type="checkbox"
+              checked={kind.includes(k)}
+              onChange={(e) =>
+                setKind((prev) =>
+                  e.target.checked ? [...prev, k] : prev.filter((x) => x !== k),
+                )
+              }
+            />
+            {k.charAt(0).toUpperCase() + k.slice(1)}
+          </label>
+        ))}
         <span className="muted">
           {loading ? 'Loading…' : `${items.length} of ${total.toLocaleString()} shown`}
         </span>
@@ -143,6 +165,8 @@ export function App() {
       <main className="content">
         <AssetGrid
           assets={items}
+          loading={loading}
+          error={error}
           selectedIds={selectedIds}
           activeId={activeId}
           onToggleSelect={toggleSelect}

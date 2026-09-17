@@ -4,6 +4,8 @@ import type { Asset } from '@/lib/types';
 
 interface Props {
   assets: Asset[];
+  loading?: boolean;
+  error?: string | null;
   selectedIds: Set<string>;
   activeId: string | null;
   onToggleSelect: (id: string) => void;
@@ -14,7 +16,31 @@ interface Props {
  * Baseline grid. Renders every row it is given, re-renders every card on any
  * selection change, and is not reachable by keyboard.
  */
-export function AssetGrid({ assets, selectedIds, activeId, onToggleSelect, onOpen }: Props) {
+export function AssetGrid({
+  assets,
+  loading,
+  error,
+  selectedIds,
+  activeId,
+  onToggleSelect,
+  onOpen,
+}: Readonly<Props>) {
+  if (loading && assets.length === 0) {
+    return (
+      <div className="empty">
+        <p>Loading assets…</p>
+      </div>
+    );
+  }
+
+  if (error && assets.length === 0) {
+    return (
+      <div className="empty">
+        <p className="error">{error}</p>
+      </div>
+    );
+  }
+
   if (assets.length === 0) {
     return (
       <div className="empty">
