@@ -12,7 +12,7 @@ interface Props {
   hasMore?: boolean;
   selectedIds: Set<string>;
   activeId: string | null;
-  onToggleSelect: (id: string) => void;
+  onToggleSelect: (id: string, isShift?: boolean) => void;
   onOpen: (id: string) => void;
   onLoadMore?: () => void;
 }

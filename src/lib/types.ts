@@ -50,3 +50,17 @@ export interface BulkResult {
   applied: number;
   failed: number;
 }
+
+export interface BulkItemFailure {
+  id: string;
+  code: 'legal_hold' | 'conflict' | 'not_found' | (string & {});
+  message?: string;
+  retryable: boolean;
+}
+
+export interface BulkExecutionResult {
+  succeeded: string[];
+  failed: BulkItemFailure[];
+  unknown: string[];
+  appliedAssets: Asset[];
+}

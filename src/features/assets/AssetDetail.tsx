@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import { getAsset, thumbnailUrl, updateAsset } from '@/api/client';
+import { getAsset, thumbnailUrl, updateAsset, ApiError } from '@/api/client';
 import { formatBytes, formatDate, formatDuration, statusLabel } from '@/lib/format';
 import type { Asset, AssetStatus } from '@/lib/types';
 
@@ -8,50 +8,99 @@ const STATUSES: AssetStatus[] = ['draft', 'in_review', 'approved', 'archived'];
 interface Props {
   id: string;
   onClose: () => void;
-  onSaved: (asset: Asset) => void;
+  onAssetChanged: (asset: Asset) => void;
 }
 
-/**
- * Baseline detail panel. Loads on open, saves with no optimistic update,
- * surfaces failures as raw strings, and does nothing about focus.
- */
-export function AssetDetail({ id, onClose, onSaved }: Readonly<Props>) {
+interface ConflictState {
+  desiredStatus: AssetStatus;
+  serverAsset: Asset;
+}
+
+export function AssetDetail({ id, onClose, onAssetChanged }: Readonly<Props>) {
   const [asset, setAsset] = useState<Asset | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
+  const [conflict, setConflict] = useState<ConflictState | null>(null);
 
   useEffect(() => {
     setAsset(null);
     setError(null);
+    setConflict(null);
     getAsset(id)
       .then(setAsset)
       .catch((err: unknown) => setError(err instanceof Error ? err.message : 'Load failed'));
   }, [id]);
 
-  async function setStatus(status: AssetStatus) {
+  async function saveStatus(status: AssetStatus, targetVersion?: number, fromConflict = false) {
     if (!asset) return;
+    const versionToUse = targetVersion ?? asset.version;
     setSaving(true);
     setError(null);
+    if (!fromConflict) {
+      setConflict(null);
+    }
     try {
-      const updated = await updateAsset(asset.id, asset.version, { status });
+      const updated = await updateAsset(asset.id, versionToUse, { status });
       setAsset(updated);
-      onSaved(updated);
-    } catch (err) {
-      setError(err instanceof Error ? err.message : 'Save failed');
+      onAssetChanged(updated);
+      setConflict(null);
+    } catch (err: unknown) {
+      if (err instanceof ApiError && err.status === 409) {
+        try {
+          const fresh = await getAsset(asset.id);
+          setConflict({ desiredStatus: status, serverAsset: fresh });
+        } catch {
+          setError('Version conflict occurred. Failed to fetch latest version.');
+        }
+      } else {
+        setError(err instanceof Error ? err.message : 'Save failed');
+      }
     } finally {
       setSaving(false);
     }
+  }
+
+  function handleReloadLatest() {
+    if (!conflict) return;
+    setAsset(conflict.serverAsset);
+    onAssetChanged(conflict.serverAsset);
+    setConflict(null);
+    setError(null);
+  }
+
+  function handleOverwrite() {
+    if (!conflict) return;
+    saveStatus(conflict.desiredStatus, conflict.serverAsset.version, true);
   }
 
   return (
     <aside className="panel">
       <div className="panel__head">
         <h2>Asset detail</h2>
-        <button onClick={onClose}>Close</button>
+        <button type="button" onClick={onClose}>
+          Close
+        </button>
       </div>
 
       {error && <p className="error">{error}</p>}
       {!asset && !error && <p className="muted">Loading…</p>}
+
+      {conflict && (
+        <div className="conflict-banner">
+          <p>
+            <strong>Conflict:</strong> This asset was modified elsewhere (now v
+            {conflict.serverAsset.version}, {statusLabel(conflict.serverAsset.status)}).
+          </p>
+          <div className="conflict-banner__actions">
+            <button type="button" disabled={saving} onClick={handleReloadLatest}>
+              Reload latest (v{conflict.serverAsset.version})
+            </button>
+            <button type="button" disabled={saving} onClick={handleOverwrite}>
+              Overwrite with {statusLabel(conflict.desiredStatus).toLowerCase()}
+            </button>
+          </div>
+        </div>
+      )}
 
       {asset && (
         <div className="panel__body">
@@ -98,9 +147,10 @@ export function AssetDetail({ id, onClose, onSaved }: Readonly<Props>) {
           <div className="row">
             {STATUSES.map((status) => (
               <button
+                type="button"
                 key={status}
                 disabled={saving || status === asset.status}
-                onClick={() => setStatus(status)}
+                onClick={() => saveStatus(status)}
               >
                 {statusLabel(status)}
               </button>

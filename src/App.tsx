@@ -1,5 +1,4 @@
-import { useState, useEffect, useCallback } from 'react';
-import { bulkSetStatus } from '@/api/client';
+import { useState, useEffect, useCallback, useRef } from 'react';
 import { AssetDetail } from '@/features/assets/AssetDetail';
 import { AssetGrid } from '@/features/assets/AssetGrid';
 import { useAssets } from '@/features/assets/useAssets';
@@ -14,6 +13,12 @@ const SORTS: Array<{ value: NonNullable<AssetQuery['sort']>; label: string }> = 
   { value: 'sizeBytes:desc', label: 'Largest first' },
   { value: 'createdAt:desc', label: 'Newest' },
 ];
+
+function formatIdList(ids: string[]): string {
+  if (ids.length === 0) return '';
+  if (ids.length <= 2) return ` (${ids.join(', ')})`;
+  return ` (${ids.slice(0, 2).join(', ')}, +${ids.length - 2} more)`;
+}
 
 function getInitialParams() {
   const params = new URLSearchParams(window.location.search);
@@ -33,14 +38,21 @@ export function App() {
   const [kind, setKind] = useState<AssetKind[]>(initial.kind);
   const [tag] = useState<string[]>(initial.tag);
   const [sort, setSort] = useState<NonNullable<AssetQuery['sort']>>(initial.sort);
-  const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
+  const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set<string>());
   const [activeId, setActiveId] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
+  const [retryTarget, setRetryTarget] = useState<{
+    ids: string[];
+    status: AssetStatus;
+  } | null>(null);
+  const [isApplyingBulk, setIsApplyingBulk] = useState(false);
+
+  const isApplyingBulkRef = useRef(false);
 
   useEffect(() => {
     const timer = setTimeout(() => {
       setDebouncedQ(q);
-    }, 300); // 300ms debounce interval
+    }, 300);
     return () => clearTimeout(timer);
   }, [q]);
 
@@ -53,45 +65,156 @@ export function App() {
     if (sort !== 'updatedAt:desc') params.set('sort', sort);
     const qs = params.toString();
     const newUrl = qs ? `?${qs}` : window.location.pathname;
-    // Use replaceState so typing doesn't create dozens of history entries
     window.history.replaceState(null, '', newUrl);
   }, [debouncedQ, sort, status, kind, tag]);
 
-  const { items, total, loading, loadingMore, error, loadMoreError, hasMore, loadMore } =
-    useAssets({
-      q: debouncedQ,
-      status,
-      kind,
-      tag,
-      sort,
-      limit: 24,
-    });
+  const {
+    items,
+    total,
+    loading,
+    loadingMore,
+    error,
+    loadMoreError,
+    hasMore,
+    loadMore,
+    applyBulkStatus,
+    updateAssetItem,
+  } = useAssets({
+    q: debouncedQ,
+    status,
+    kind,
+    tag,
+    sort,
+    limit: 24,
+  });
 
-  const toggleSelect = useCallback((id: string) => {
-    setSelectedIds((prev) => {
-      const next = new Set(prev);
-      if (next.has(id)) next.delete(id);
-      else next.add(id);
-      return next;
-    });
+  const itemsRef = useRef<Asset[]>(items);
+  itemsRef.current = items;
+
+  const selectedIdsRef = useRef<Set<string>>(selectedIds);
+  selectedIdsRef.current = selectedIds;
+
+  const lastSelectedIdRef = useRef<string | null>(null);
+
+  // Clear selection, anchor, and prior notices on search/filter changes (preserves across sort)
+  useEffect(() => {
+    setSelectedIds(new Set<string>());
+    lastSelectedIdRef.current = null;
+    setNotice(null);
+    setRetryTarget(null);
+  }, [debouncedQ, status, kind, tag]);
+
+  const toggleSelect = useCallback((id: string, isShift?: boolean) => {
+    const currentItems = itemsRef.current;
+    const prev = selectedIdsRef.current;
+    const next = new Set<string>(prev);
+
+    if (isShift && lastSelectedIdRef.current) {
+      const lastIndex = currentItems.findIndex((a: Asset) => a.id === lastSelectedIdRef.current);
+      const currentIndex = currentItems.findIndex((a: Asset) => a.id === id);
+
+      if (lastIndex !== -1 && currentIndex !== -1) {
+        const [start, end] =
+          lastIndex < currentIndex ? [lastIndex, currentIndex] : [currentIndex, lastIndex];
+        for (let i = start; i <= end; i++) {
+          const item = currentItems[i];
+          if (item) next.add(item.id);
+        }
+        lastSelectedIdRef.current = id;
+        selectedIdsRef.current = next;
+        setSelectedIds(next);
+        return;
+      }
+    }
+
+    if (next.has(id)) {
+      next.delete(id);
+    } else {
+      next.add(id);
+    }
+
+    lastSelectedIdRef.current = id;
+    selectedIdsRef.current = next;
+    setSelectedIds(next);
   }, []);
 
-  async function applyBulkStatus(next: AssetStatus) {
-    const ids = [...selectedIds];
-    if (ids.length === 0) return;
-    setNotice(null);
-    try {
-      // Sends every selected id in one call, which the API refuses above 50.
-      const result = await bulkSetStatus(ids, next);
-      setNotice(`${result.applied} updated, ${result.failed} failed.`);
-      setSelectedIds(new Set());
-    } catch (err) {
-      setNotice(err instanceof Error ? err.message : 'Bulk update failed');
-    }
-  }
+  const selectAllLoaded = useCallback(() => {
+    const allIds = new Set<string>(itemsRef.current.map((a: Asset) => a.id));
+    selectedIdsRef.current = allIds;
+    setSelectedIds(allIds);
+  }, []);
 
-  function handleSaved(_asset: Asset) {
-    // The list is not told that anything changed, so it shows stale rows.
+  const clearSelection = useCallback(() => {
+    const empty = new Set<string>();
+    selectedIdsRef.current = empty;
+    lastSelectedIdRef.current = null;
+    setSelectedIds(empty);
+  }, []);
+
+  async function applyBulkStatusHandler(next: AssetStatus, explicitIds?: string[]) {
+    if (isApplyingBulkRef.current) return;
+    const ids = explicitIds ?? [...selectedIdsRef.current];
+    if (ids.length === 0) return;
+
+    isApplyingBulkRef.current = true;
+    setIsApplyingBulk(true);
+    setNotice(null);
+    setRetryTarget(null);
+
+    try {
+      const result = await applyBulkStatus(ids, next);
+
+      // Deselect succeeded IDs; keep failed & unknown selected for retry
+      setSelectedIds((prev) => {
+        const nextSet = new Set(prev);
+        result.succeeded.forEach((id) => nextSet.delete(id));
+        selectedIdsRef.current = nextSet;
+        return nextSet;
+      });
+
+      // Retain retryable IDs
+      const retryableIds = [
+        ...result.failed.filter((f) => f.retryable).map((f) => f.id),
+        ...result.unknown,
+      ];
+
+      if (retryableIds.length > 0) {
+        setRetryTarget({ ids: retryableIds, status: next });
+      }
+
+      // Build human-readable notice breakdown with failed IDs
+      const legalHoldItems = result.failed.filter((f) => f.code === 'legal_hold');
+      const notFoundItems = result.failed.filter((f) => f.code === 'not_found');
+      const conflictItems = result.failed.filter((f) => f.code === 'conflict');
+      const otherItems = result.failed.filter(
+        (f) => f.code !== 'legal_hold' && f.code !== 'not_found' && f.code !== 'conflict',
+      );
+
+      const parts: string[] = [];
+      if (result.succeeded.length > 0) {
+        parts.push(`${result.succeeded.length} updated`);
+      }
+      if (legalHoldItems.length > 0) {
+        parts.push(`${legalHoldItems.length} blocked by legal hold${formatIdList(legalHoldItems.map((i) => i.id))}`);
+      }
+      if (notFoundItems.length > 0) {
+        parts.push(`${notFoundItems.length} not found${formatIdList(notFoundItems.map((i) => i.id))}`);
+      }
+      if (conflictItems.length > 0) {
+        parts.push(`${conflictItems.length} write conflict${formatIdList(conflictItems.map((i) => i.id))}`);
+      }
+      if (otherItems.length > 0) {
+        parts.push(`${otherItems.length} failed${formatIdList(otherItems.map((i) => i.id))}`);
+      }
+      if (result.unknown.length > 0) {
+        parts.push(`${result.unknown.length} unconfirmed due to network error`);
+      }
+
+      setNotice(parts.join(' · '));
+    } finally {
+      isApplyingBulkRef.current = false;
+      setIsApplyingBulk(false);
+    }
   }
 
   return (
@@ -148,19 +271,50 @@ export function App() {
         </span>
       </div>
 
+      {/* Bulk action toolbar */}
       {selectedIds.size > 0 && (
-        <div className="bulkbar">
-          <span>{selectedIds.size} selected</span>
+        <div className="bulkbar" role="toolbar" aria-label="Bulk actions">
+          <span className="bulkbar__count">
+            {selectedIds.size} of {items.length} loaded selected
+          </span>
+          {selectedIds.size < items.length && (
+            <button type="button" disabled={isApplyingBulk} onClick={selectAllLoaded}>
+              Select all {items.length} loaded
+            </button>
+          )}
           {STATUSES.map((s) => (
-            <button key={s} onClick={() => applyBulkStatus(s)}>
-              Set {statusLabel(s).toLowerCase()}
+            <button
+              type="button"
+              key={s}
+              disabled={isApplyingBulk}
+              onClick={() => applyBulkStatusHandler(s)}
+            >
+              {isApplyingBulk ? 'Updating…' : `Set ${statusLabel(s).toLowerCase()}`}
             </button>
           ))}
-          <button onClick={() => setSelectedIds(new Set())}>Clear selection</button>
+          <button type="button" disabled={isApplyingBulk} onClick={clearSelection}>
+            Clear selection
+          </button>
         </div>
       )}
 
-      {notice && <p className="notice">{notice}</p>}
+      {/* Notice with Retry Button */}
+      {notice && (
+        <div className="notice-banner">
+          <p className="notice">{notice}</p>
+          {retryTarget && (
+            <button
+              type="button"
+              className="notice__btn"
+              disabled={isApplyingBulk}
+              onClick={() => applyBulkStatusHandler(retryTarget.status, retryTarget.ids)}
+            >
+              Retry {retryTarget.ids.length} items
+            </button>
+          )}
+        </div>
+      )}
+
       {error && <p className="error">{error}</p>}
 
       <main className="content">
@@ -178,7 +332,11 @@ export function App() {
           onLoadMore={loadMore}
         />
         {activeId && (
-          <AssetDetail id={activeId} onClose={() => setActiveId(null)} onSaved={handleSaved} />
+          <AssetDetail
+            id={activeId}
+            onClose={() => setActiveId(null)}
+            onAssetChanged={updateAssetItem}
+          />
         )}
       </main>
     </div>

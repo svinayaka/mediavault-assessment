@@ -35,7 +35,7 @@ export interface CardProps {
   asset: Asset;
   isSelected: boolean;
   isActive: boolean;
-  onToggleSelect: (id: string) => void;
+  onToggleSelect: (id: string, isShift?: boolean) => void;
   onOpen: (id: string) => void;
 }
 
@@ -92,8 +92,13 @@ export const AssetCard = memo(function AssetCard({
         className="card__check"
         checked={isSelected}
         aria-label={`Select ${asset.name}`}
-        onClick={(e) => e.stopPropagation()}
-        onChange={() => onToggleSelect(asset.id)}
+        onClick={(e) => {
+          e.stopPropagation();
+          onToggleSelect(asset.id, e.shiftKey);
+        }}
+        onChange={() => {
+          // Handled in onClick to capture mouse shiftKey event
+        }}
       />
     </div>
   );

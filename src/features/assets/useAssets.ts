@@ -1,6 +1,12 @@
 import { useEffect, useState, useRef, useCallback } from 'react';
-import { listAssets } from '@/api/client';
-import type { Asset, AssetPage, AssetQuery } from '@/lib/types';
+import { listAssets, bulkSetStatus } from '@/api/client';
+import type {
+  Asset,
+  AssetPage,
+  AssetQuery,
+  AssetStatus,
+  BulkExecutionResult,
+} from '@/lib/types';
 
 interface State {
   items: Asset[];
@@ -26,6 +32,9 @@ export function useAssets(query: AssetQuery) {
   const generationRef = useRef(0);
   const inFlightRef = useRef(false);
   const initialLoadingRef = useRef(true);
+
+  const itemsRef = useRef<Asset[]>(state.items);
+  itemsRef.current = state.items;
 
   /**
    * Cursors are strictly bound to the exact query that produced them (API contract: API.md).
@@ -147,23 +156,94 @@ export function useAssets(query: AssetQuery) {
         loadMoreError: err instanceof Error ? err.message : 'Failed to load more assets',
       }));
     } finally {
-      // inFlightRef represents whether this specific execution finished, unconditionally
       inFlightRef.current = false;
       if (myGen === generationRef.current) {
         loadMoreAbortRef.current = null;
       }
     }
-  }, []); // Stable callback identity that never needs to rebind scroll listeners
+  }, []);
+
+  const updateAssetItem = useCallback((updated: Asset) => {
+    setState((prev) => ({
+      ...prev,
+      items: prev.items.map((item) => (item.id === updated.id ? { ...item, ...updated } : item)),
+    }));
+  }, []);
+
+  const applyBulkStatus = useCallback(
+    async (ids: string[], next: AssetStatus): Promise<BulkExecutionResult> => {
+      if (ids.length === 0) {
+        return { succeeded: [], failed: [], unknown: [], appliedAssets: [] };
+      }
+
+      const myGen = generationRef.current;
+
+      // 1. Snapshot previous status of target items
+      const targetIds = new Set(ids);
+      const snapshot = new Map<string, AssetStatus>();
+      for (const item of itemsRef.current) {
+        if (targetIds.has(item.id)) {
+          snapshot.set(item.id, item.status);
+        }
+      }
+
+      // 2. Apply optimistic local update
+      setState((prev) => ({
+        ...prev,
+        items: prev.items.map((item) =>
+          targetIds.has(item.id) ? { ...item, status: next } : item,
+        ),
+      }));
+
+      // 3. Delegate execution to chunked client helper
+      const result = await bulkSetStatus(ids, next);
+
+      // 4. Guard against race with query/filter changes
+      if (myGen !== generationRef.current) return result;
+
+      // 5. Rollback failed and unknown items; reconcile version/metadata of succeeded items
+      const rollbackMap = new Map<string, AssetStatus>();
+      for (const f of result.failed) {
+        const orig = snapshot.get(f.id);
+        if (orig !== undefined) rollbackMap.set(f.id, orig);
+      }
+      for (const u of result.unknown) {
+        const orig = snapshot.get(u);
+        if (orig !== undefined) rollbackMap.set(u, orig);
+      }
+
+      const appliedMap = new Map<string, Asset>(result.appliedAssets.map((a) => [a.id, a]));
+
+      setState((prev) => ({
+        ...prev,
+        items: prev.items.map((item) => {
+          const rollbackStatus = rollbackMap.get(item.id);
+          if (rollbackStatus !== undefined) {
+            return { ...item, status: rollbackStatus };
+          }
+          const applied = appliedMap.get(item.id);
+          if (applied) {
+            return applied;
+          }
+          return item;
+        }),
+      }));
+
+      return result;
+    },
+    [],
+  );
 
   return {
     items: state.items,
     total: state.total,
-    // Note: `hasMore` derives from rendered state for UI consistency, while `cursorContextRef` gates fetch executions.
     hasMore: state.nextCursor !== null,
     loading: state.loading,
     loadingMore: state.loadingMore,
     error: state.error,
     loadMoreError: state.loadMoreError,
     loadMore,
+    applyBulkStatus,
+    updateAssetItem,
   };
 }

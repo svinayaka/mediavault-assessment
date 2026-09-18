@@ -1,15 +1,26 @@
-import type { Asset, AssetPage, AssetQuery, BulkResult } from '@/lib/types';
+import type {
+  Asset,
+  AssetPage,
+  AssetQuery,
+  BulkResult,
+  AssetStatus,
+  BulkExecutionResult,
+  BulkItemFailure,
+} from '@/lib/types';
 
-/**
- * Baseline client. It works on a good network and falls apart on a bad one.
- *
- * Known gaps, all of which are yours to close:
- *   - no request cancellation
- *   - no retry, no backoff, no handling of Retry-After
- *   - no de-duplication of concurrent identical requests
- *   - error information is flattened into a string
- *   - callers cannot distinguish "retry this" from "do not retry this"
- */
+export class ApiError extends Error {
+  readonly status: number;
+  readonly code?: string;
+  readonly retryAfterMs?: number;
+
+  constructor(message: string, status: number, code?: string, retryAfterMs?: number) {
+    super(message);
+    this.name = 'ApiError';
+    this.status = status;
+    this.code = code;
+    this.retryAfterMs = retryAfterMs;
+  }
+}
 
 const inFlight = new Map<string, Promise<unknown>>();
 
@@ -44,55 +55,38 @@ function toSearchParams(query: AssetQuery): string {
 }
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
-  const callerSignal = init?.signal;
-  const { signal: _, ...fetchInit } = init ?? {};
-
   const performFetch = async () => {
     const res = await fetch(path, {
-      ...fetchInit,
-      headers: { 'content-type': 'application/json', ...(fetchInit.headers ?? {}) },
+      ...init,
+      headers: { 'content-type': 'application/json', ...(init?.headers ?? {}) },
     });
     if (!res.ok) {
       let detail = res.statusText;
+      let code: string | undefined;
       try {
         const body = await res.json();
-        detail = body?.error?.message ?? detail;
+        detail = body?.error?.message ?? body?.message ?? detail;
+        code = body?.error?.code ?? body?.code;
       } catch {
         /* response was not JSON */
       }
-      throw new Error(`${res.status}: ${detail}`);
+      const retryAfterHeader = res.headers.get('retry-after');
+      const retryAfterMs = retryAfterHeader ? Number.parseInt(retryAfterHeader, 10) * 1000 : undefined;
+      throw new ApiError(detail, res.status, code, retryAfterMs);
     }
     return res.json() as Promise<T>;
   };
 
   const key = requestKey(path, init);
-  const promise = key ? dedupe(key, performFetch) : performFetch();
-
-  if (!callerSignal) {
-    return promise;
+  if (key && !init?.signal) {
+    return dedupe(key, performFetch);
   }
-
-  return new Promise<T>((resolve, reject) => {
-    if (callerSignal.aborted) {
-      return reject(new DOMException('Aborted', 'AbortError'));
-    }
-    const onAbort = () => reject(new DOMException('Aborted', 'AbortError'));
-    callerSignal.addEventListener('abort', onAbort, { once: true });
-    promise
-      .then((val) => {
-        callerSignal.removeEventListener('abort', onAbort);
-        resolve(val);
-      })
-      .catch((err) => {
-        callerSignal.removeEventListener('abort', onAbort);
-        reject(err);
-      });
-  });
+  return performFetch();
 }
 
 export function listAssets(query: AssetQuery, signal?: AbortSignal): Promise<AssetPage> {
   return request<AssetPage>(`/api/assets?${toSearchParams(query)}`, {
-    signal
+    signal,
   });
 }
 
@@ -100,9 +94,45 @@ export function getAsset(id: string): Promise<Asset> {
   return request<Asset>(`/api/assets/${id}`);
 }
 
-export function getAssetsByIds(ids: string[]): Promise<{ items: Asset[]; missing: string[] }> {
-  // Note: the endpoint rejects more than 25 ids per call.
-  return request(`/api/assets/batch?ids=${ids.join(',')}`);
+function chunk<T>(items: T[], size: number): T[][] {
+  const chunks: T[][] = [];
+  for (let i = 0; i < items.length; i += size) {
+    chunks.push(items.slice(i, i + size));
+  }
+  return chunks;
+}
+
+export async function mapConcurrent<T, R>(
+  items: T[],
+  concurrency: number,
+  fn: (item: T) => Promise<R>,
+): Promise<R[]> {
+  const results: R[] = new Array(items.length);
+  let index = 0;
+  const workers = Array.from({ length: Math.min(concurrency, items.length) }, async () => {
+    while (index < items.length) {
+      const currentIndex = index++;
+      results[currentIndex] = await fn(items[currentIndex]!);
+    }
+  });
+  await Promise.all(workers);
+  return results;
+}
+
+export async function getAssetsByIds(ids: string[]): Promise<{ items: Asset[]; missing: string[] }> {
+  if (ids.length === 0) return { items: [], missing: [] };
+  const chunks = chunk(ids, 25);
+  const chunkResults = await mapConcurrent(chunks, 3, (batchIds) =>
+    request<{ items: Asset[]; missing: string[] }>(`/api/assets/batch?ids=${batchIds.join(',')}`),
+  );
+
+  const items: Asset[] = [];
+  const missing: string[] = [];
+  for (const res of chunkResults) {
+    items.push(...res.items);
+    missing.push(...res.missing);
+  }
+  return { items, missing };
 }
 
 export function updateAsset(
@@ -116,12 +146,55 @@ export function updateAsset(
   });
 }
 
-export function bulkSetStatus(ids: string[], status: Asset['status']): Promise<BulkResult> {
-  // Note: the endpoint rejects more than 50 ids per call.
-  return request<BulkResult>('/api/assets/bulk-status', {
-    method: 'POST',
-    body: JSON.stringify({ ids, status }),
+export async function bulkSetStatus(
+  ids: string[],
+  status: AssetStatus,
+): Promise<BulkExecutionResult> {
+  if (ids.length === 0) {
+    return { succeeded: [], failed: [], unknown: [], appliedAssets: [] };
+  }
+
+  const chunks = chunk(ids, 50);
+  const chunkResults = await mapConcurrent(chunks, 3, async (batchIds) => {
+    try {
+      const res = await request<BulkResult>('/api/assets/bulk-status', {
+        method: 'POST',
+        body: JSON.stringify({ ids: batchIds, status }),
+      });
+      return { ok: true as const, res, batchIds };
+    } catch {
+      return { ok: false as const, batchIds };
+    }
   });
+
+  const succeeded: string[] = [];
+  const failed: BulkItemFailure[] = [];
+  const unknown: string[] = [];
+  const appliedAssets: Asset[] = [];
+
+  for (const chunkRes of chunkResults) {
+    if (!chunkRes.ok) {
+      unknown.push(...chunkRes.batchIds);
+      continue;
+    }
+
+    for (const r of chunkRes.res.results) {
+      if (r.ok) {
+        succeeded.push(r.id);
+        appliedAssets.push(r.asset);
+      } else {
+        const retryable = r.code !== 'legal_hold' && r.code !== 'not_found';
+        failed.push({
+          id: r.id,
+          code: r.code,
+          message: r.message,
+          retryable,
+        });
+      }
+    }
+  }
+
+  return { succeeded, failed, unknown, appliedAssets };
 }
 
 export const thumbnailUrl = (id: string) => `/api/thumb/${id}.svg`;
