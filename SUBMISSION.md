@@ -114,9 +114,30 @@ What was the actual bottleneck, and how did you find it?
 
 ## Accessibility
 
-- Keyboard model you implemented, in one paragraph.
-- How you tested it, including any screen reader.
-- Known gaps.
+**Keyboard model**
+The asset grid uses a roving tabindex. Exactly one gridcell has tabIndex=0 at a time (the focused card); all others have tabIndex=-1. Tab enters the grid at the focused card, not at 12,400 stops. Arrow keys move focus: Left/Right between cards in a row, Up/Down between rows, Home/End to first/last loaded, PageUp/PageDown to jump four rows. Space toggles selection on the focused card. Shift+Arrow extends range selection from the last anchor. Enter opens the detail panel. Focus moves into the panel heading on open; Escape closes the panel and returns focus to the card that was open (via an imperative `focusCard()` handle exposed by `AssetGrid`). The panel is not a focus trap — Tab past the last panel element exits to browser chrome, per the brief's "no focus traps" requirement. If a focused card is removed by filtering, the grid's unmount-strategy effect resets `focusedId` to the first available card and re-focuses it when mounted. In the rare case where the first card is virtualized out of view, focus recovers on the next interaction.
+
+**Semantics**
+- `role="grid"` on container with `aria-rowcount`, `aria-colcount`
+- `role="row"` on virtualized row wrappers with `aria-rowindex` (1-based)
+- `role="gridcell"` on cards with `aria-selected` and a composite `aria-label` of `"{name}, {kind}, {status}, {selected|}"`
+- Decorative thumbnails and SVG icons have `aria-hidden`/`alt=""`
+- Selection toggle announces via a dedicated `aria-live="polite"` region ("Selected {name}" / "Deselected {name}")
+- Result counts and bulk outcomes announce via a separate `aria-live="polite"` region, tied to debounced query (not raw input)
+
+**How I tested it**
+Ran VoiceOver (macOS, Cmd+F5) with chaos on. Verified:
+- Arrow key navigation moves focus between cards; VoiceOver announces each card cleanly as `"{name}, {kind}, {status}, gridcell"`
+- Space toggles selection; VoiceOver announces `"Selected {name}"` / `"Deselected {name}"`
+- Shift+Arrow extends range; announcements fire for newly-included cards
+- Enter opens the panel; VoiceOver announces the panel heading as `"Asset detail, heading level 2"`
+- Escape closes the panel and focus returns to the opening card
+- `prefers-reduced-motion: reduce` stops the offline banner's pulse animation (verified via Chrome DevTools Rendering panel)
+
+**Known gaps**
+- Escape behavior on the search input follows browser default (clears in Chrome, preserved in Safari). App does not intercept.
+- The detail panel is non-modal; tabbing past the last panel element exits to browser chrome. Intentional per brief's "no focus traps."
+- Home/End/PageUp/PageDown on Mac require Fn+arrow. Verified working.
 
 ---
 

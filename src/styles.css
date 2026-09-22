@@ -412,6 +412,12 @@ button:disabled {
   50% { opacity: 0.4; transform: scale(0.85); }
 }
 
+@media (prefers-reduced-motion: reduce) {
+  .offline-banner__dot {
+    animation: none;
+  }
+}
+
 /* Panel Error Boundary Fallback */
 .panel-error-fallback {
   padding: 24px 16px;
@@ -446,5 +452,41 @@ button:disabled {
 
 .btn--retry:hover {
   background: #1d4ed8;
+}
+
+/* Accessibility & Focus Rings */
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+.card:focus-visible,
+.card[data-focused='true']:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 2px var(--accent, #2563eb);
+  z-index: 1;
+}
+
+.grid:focus-visible {
+  outline: 2px solid var(--accent, #2563eb);
+  outline-offset: -2px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
 }
 

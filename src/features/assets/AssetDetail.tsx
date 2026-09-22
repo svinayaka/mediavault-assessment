@@ -1,4 +1,4 @@
-import { useEffect, useState, useCallback } from 'react';
+import { useEffect, useState, useCallback, useRef } from 'react';
 import { getAsset, thumbnailUrl, updateAsset, ApiError } from '@/api/client';
 import { getActionableErrorMessage } from '@/api/errorClassifier';
 import { formatBytes, formatDate, formatDuration, statusLabel } from '@/lib/format';
@@ -24,6 +24,26 @@ export function AssetDetail({ id, onClose, onAssetChanged, onSavingChange }: Rea
   const [isUnconfirmed, setIsUnconfirmed] = useState(false);
   const [saving, setSaving] = useState(false);
   const [conflict, setConflict] = useState<ConflictState | null>(null);
+  const headingRef = useRef<HTMLHeadingElement>(null);
+
+  useEffect(() => {
+    headingRef.current?.focus();
+  }, []);
+
+  // Global window listener: standard modal/panel convention allowing users to dismiss the open detail panel from anywhere in the viewport via Escape
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') {
+        e.preventDefault();
+        onClose();
+      }
+    };
+
+    window.addEventListener('keydown', handleKeyDown);
+    return () => {
+      window.removeEventListener('keydown', handleKeyDown);
+    };
+  }, [onClose]);
 
   const loadAsset = useCallback((assetId: string) => {
     setError(null);
@@ -91,10 +111,15 @@ export function AssetDetail({ id, onClose, onAssetChanged, onSavingChange }: Rea
   }
 
   return (
-    <aside className="panel" aria-label="Asset detail panel">
+    <section
+      className="panel"
+      aria-label="Asset detail panel"
+    >
       <div className="panel__head">
-        <h2>Asset detail</h2>
-        <button type="button" onClick={onClose}>
+        <h2 ref={headingRef} tabIndex={-1} style={{ outline: 'none' }}>
+          Asset detail
+        </h2>
+        <button type="button" onClick={onClose} aria-label="Close detail panel">
           Close
         </button>
       </div>
@@ -190,6 +215,6 @@ export function AssetDetail({ id, onClose, onAssetChanged, onSavingChange }: Rea
           </div>
         </div>
       )}
-    </aside>
+    </section>
   );
 }

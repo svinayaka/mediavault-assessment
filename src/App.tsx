@@ -1,6 +1,6 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
 import { AssetDetail } from '@/features/assets/AssetDetail';
-import { AssetGrid } from '@/features/assets/AssetGrid';
+import { AssetGrid, type AssetGridHandle } from '@/features/assets/AssetGrid';
 import { useAssets } from '@/features/assets/useAssets';
 import { OfflineBanner } from '@/components/OfflineBanner';
 import { PanelBoundary } from '@/components/PanelBoundary';
@@ -74,6 +74,7 @@ export function App() {
   } | null>(null);
   const [isApplyingBulk, setIsApplyingBulk] = useState(false);
   const [isSavingDetail, setIsSavingDetail] = useState(false);
+  const [selectionAnnouncement, setSelectionAnnouncement] = useState('');
 
   const isApplyingBulkRef = useRef(false);
 
@@ -163,6 +164,8 @@ export function App() {
   const toggleSelect = useCallback((id: string, isShift?: boolean) => {
     const lastId = lastSelectedIdRef.current;
     const prev = selectedIdsRef.current;
+    const wasSelected = prev.has(id);
+    const assetName = itemsRef.current.find((a) => a.id === id)?.name ?? id;
 
     let next: Set<string> | null = null;
     if (isShift && lastId) {
@@ -177,6 +180,10 @@ export function App() {
         next.add(id);
       }
     }
+
+    setSelectionAnnouncement(
+      `${wasSelected ? 'Deselected' : 'Selected'} ${assetName}`
+    );
 
     lastSelectedIdRef.current = id;
     selectedIdsRef.current = next;
@@ -262,10 +269,46 @@ export function App() {
     }
   }
 
+  const [focusedId, setFocusedId] = useState<string | null>(null);
+  const prevActiveIdRef = useRef<string | null>(null);
+  const gridRef = useRef<AssetGridHandle>(null);
+
+  // Deterministic post-commit focus restoration when panel closes
+  useEffect(() => {
+    const prev = prevActiveIdRef.current;
+    prevActiveIdRef.current = activeId;
+
+    if (prev !== null && activeId === null) {
+      setFocusedId(prev);
+      gridRef.current?.focusCard(prev);
+    }
+  }, [activeId]);
+
+  const handleOpenDetail = useCallback((id: string) => {
+    setActiveId(id);
+  }, []);
+
+  const handleCloseDetail = useCallback(() => {
+    setActiveId(null);
+  }, []);
+
   const gridResetKey = `${debouncedQ}:${sort}:${status.join(',')}:${kind.join(',')}:${tag.join(',')}`;
 
   return (
     <div className="app">
+      {/* Accessible polite live region for screen readers */}
+      <div aria-live="polite" aria-atomic="true" className="sr-only">
+        {loading
+          ? 'Loading assets…'
+          : `${items.length} of ${total.toLocaleString()} assets shown.`}
+        {notice ? ` Notice: ${notice}` : ''}
+      </div>
+
+      {/* Selection change polite live region for screen readers */}
+      <div aria-live="polite" aria-atomic="true" className="sr-only">
+        {selectionAnnouncement}
+      </div>
+
       {/* Root-level offline banner outside all panel error boundaries */}
       <OfflineBanner />
 
@@ -372,6 +415,7 @@ export function App() {
           onRetry={refetch}
         >
           <AssetGrid
+            ref={gridRef}
             assets={items}
             loading={loading}
             loadingMore={loadingMore}
@@ -380,8 +424,10 @@ export function App() {
             hasMore={hasMore}
             selectedIds={selectedIds}
             activeId={activeId}
+            focusedId={focusedId}
+            onFocusCard={setFocusedId}
             onToggleSelect={toggleSelect}
-            onOpen={setActiveId}
+            onOpen={handleOpenDetail}
             onLoadMore={loadMore}
           />
         </PanelBoundary>
@@ -398,7 +444,7 @@ export function App() {
           >
             <AssetDetail
               id={activeId}
-              onClose={() => setActiveId(null)}
+              onClose={handleCloseDetail}
               onAssetChanged={updateAssetItem}
               onSavingChange={setIsSavingDetail}
             />
