@@ -1,5 +1,6 @@
 import { useEffect, useState, useRef, useCallback } from 'react';
 import { listAssets, bulkSetStatus } from '@/api/client';
+import { getActionableErrorMessage } from '@/api/errorClassifier';
 import type {
   Asset,
   AssetPage,
@@ -28,6 +29,8 @@ export function useAssets(query: AssetQuery) {
     error: null,
     loadMoreError: null,
   });
+
+  const [reloadTrigger, setReloadTrigger] = useState(0);
 
   const generationRef = useRef(0);
   const inFlightRef = useRef(false);
@@ -94,7 +97,7 @@ export function useAssets(query: AssetQuery) {
           ...s,
           loading: false,
           loadingMore: false,
-          error: err instanceof Error ? err.message : 'Failed to load assets',
+          error: getActionableErrorMessage(err, { operation: 'search' }),
         }));
       });
 
@@ -110,7 +113,12 @@ export function useAssets(query: AssetQuery) {
     query.status?.join(','),
     query.kind?.join(','),
     query.tag?.join(','),
+    reloadTrigger,
   ]);
+
+  const refetch = useCallback(() => {
+    setReloadTrigger((v) => v + 1);
+  }, []);
 
   // Load next page
   const loadMore = useCallback(async () => {
@@ -153,7 +161,7 @@ export function useAssets(query: AssetQuery) {
       setState((s) => ({
         ...s,
         loadingMore: false,
-        loadMoreError: err instanceof Error ? err.message : 'Failed to load more assets',
+        loadMoreError: getActionableErrorMessage(err, { operation: 'load_more' }),
       }));
     } finally {
       inFlightRef.current = false;
@@ -242,6 +250,7 @@ export function useAssets(query: AssetQuery) {
     loadingMore: state.loadingMore,
     error: state.error,
     loadMoreError: state.loadMoreError,
+    refetch,
     loadMore,
     applyBulkStatus,
     updateAssetItem,

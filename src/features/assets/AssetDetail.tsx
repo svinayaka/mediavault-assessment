@@ -1,5 +1,6 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useState, useCallback } from 'react';
 import { getAsset, thumbnailUrl, updateAsset, ApiError } from '@/api/client';
+import { getActionableErrorMessage } from '@/api/errorClassifier';
 import { formatBytes, formatDate, formatDuration, statusLabel } from '@/lib/format';
 import type { Asset, AssetStatus } from '@/lib/types';
 
@@ -9,6 +10,7 @@ interface Props {
   id: string;
   onClose: () => void;
   onAssetChanged: (asset: Asset) => void;
+  onSavingChange?: (saving: boolean) => void;
 }
 
 interface ConflictState {
@@ -16,26 +18,37 @@ interface ConflictState {
   serverAsset: Asset;
 }
 
-export function AssetDetail({ id, onClose, onAssetChanged }: Readonly<Props>) {
+export function AssetDetail({ id, onClose, onAssetChanged, onSavingChange }: Readonly<Props>) {
   const [asset, setAsset] = useState<Asset | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [isUnconfirmed, setIsUnconfirmed] = useState(false);
   const [saving, setSaving] = useState(false);
   const [conflict, setConflict] = useState<ConflictState | null>(null);
 
+  const loadAsset = useCallback((assetId: string) => {
+    setError(null);
+    setIsUnconfirmed(false);
+    getAsset(assetId)
+      .then((loaded) => {
+        setAsset(loaded);
+        onAssetChanged(loaded);
+      })
+      .catch((err: unknown) => setError(getActionableErrorMessage(err, { operation: 'load_asset' })));
+  }, [onAssetChanged]);
+
   useEffect(() => {
     setAsset(null);
-    setError(null);
     setConflict(null);
-    getAsset(id)
-      .then(setAsset)
-      .catch((err: unknown) => setError(err instanceof Error ? err.message : 'Load failed'));
-  }, [id]);
+    loadAsset(id);
+  }, [id, loadAsset]);
 
   async function saveStatus(status: AssetStatus, targetVersion?: number, fromConflict = false) {
     if (!asset) return;
     const versionToUse = targetVersion ?? asset.version;
     setSaving(true);
+    onSavingChange?.(true);
     setError(null);
+    setIsUnconfirmed(false);
     if (!fromConflict) {
       setConflict(null);
     }
@@ -45,7 +58,7 @@ export function AssetDetail({ id, onClose, onAssetChanged }: Readonly<Props>) {
       onAssetChanged(updated);
       setConflict(null);
     } catch (err: unknown) {
-      if (err instanceof ApiError && err.status === 409) {
+      if (err instanceof ApiError && err.status === 409 && !err.unconfirmed) {
         try {
           const fresh = await getAsset(asset.id);
           setConflict({ desiredStatus: status, serverAsset: fresh });
@@ -53,10 +66,14 @@ export function AssetDetail({ id, onClose, onAssetChanged }: Readonly<Props>) {
           setError('Version conflict occurred. Failed to fetch latest version.');
         }
       } else {
-        setError(err instanceof Error ? err.message : 'Save failed');
+        if (err instanceof ApiError && err.unconfirmed) {
+          setIsUnconfirmed(true);
+        }
+        setError(getActionableErrorMessage(err, { operation: 'save_asset' }));
       }
     } finally {
       setSaving(false);
+      onSavingChange?.(false);
     }
   }
 
@@ -74,7 +91,7 @@ export function AssetDetail({ id, onClose, onAssetChanged }: Readonly<Props>) {
   }
 
   return (
-    <aside className="panel">
+    <aside className="panel" aria-label="Asset detail panel">
       <div className="panel__head">
         <h2>Asset detail</h2>
         <button type="button" onClick={onClose}>
@@ -82,7 +99,22 @@ export function AssetDetail({ id, onClose, onAssetChanged }: Readonly<Props>) {
         </button>
       </div>
 
-      {error && <p className="error">{error}</p>}
+      {error && (
+        <div className="notice-banner notice-banner--error" role="alert">
+          <p className="error">{error}</p>
+          {isUnconfirmed && (
+            <button
+              type="button"
+              className="notice__btn"
+              disabled={saving}
+              onClick={() => loadAsset(id)}
+            >
+              Reload asset to verify
+            </button>
+          )}
+        </div>
+      )}
+
       {!asset && !error && <p className="muted">Loading…</p>}
 
       {conflict && (

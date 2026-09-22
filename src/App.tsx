@@ -2,6 +2,9 @@ import { useState, useEffect, useCallback, useRef } from 'react';
 import { AssetDetail } from '@/features/assets/AssetDetail';
 import { AssetGrid } from '@/features/assets/AssetGrid';
 import { useAssets } from '@/features/assets/useAssets';
+import { OfflineBanner } from '@/components/OfflineBanner';
+import { PanelBoundary } from '@/components/PanelBoundary';
+import { useOnlineStatus } from '@/hooks/useOnlineStatus';
 import { statusLabel } from '@/lib/format';
 import type { Asset, AssetStatus, AssetKind, AssetQuery } from '@/lib/types';
 
@@ -30,6 +33,30 @@ function getInitialParams() {
   return { q, status, kind, tag, sort };
 }
 
+function computeRangeSelection(
+  items: Asset[],
+  startId: string,
+  endId: string,
+  prevSelection: Set<string>,
+): Set<string> | null {
+  const startIndex = items.findIndex((a) => a.id === startId);
+  const endIndex = items.findIndex((a) => a.id === endId);
+
+  if (startIndex === -1 || endIndex === -1) {
+    return null;
+  }
+
+  const next = new Set(prevSelection);
+  const [min, max] = startIndex < endIndex ? [startIndex, endIndex] : [endIndex, startIndex];
+  for (let i = min; i <= max; i++) {
+    const item = items[i];
+    if (item) {
+      next.add(item.id);
+    }
+  }
+  return next;
+}
+
 export function App() {
   const initial = getInitialParams();
   const [q, setQ] = useState(initial.q);
@@ -46,8 +73,12 @@ export function App() {
     status: AssetStatus;
   } | null>(null);
   const [isApplyingBulk, setIsApplyingBulk] = useState(false);
+  const [isSavingDetail, setIsSavingDetail] = useState(false);
 
   const isApplyingBulkRef = useRef(false);
+
+  const { isOnline } = useOnlineStatus();
+  const wasOnlineRef = useRef(isOnline);
 
   useEffect(() => {
     const timer = setTimeout(() => {
@@ -76,6 +107,7 @@ export function App() {
     error,
     loadMoreError,
     hasMore,
+    refetch,
     loadMore,
     applyBulkStatus,
     updateAssetItem,
@@ -87,6 +119,30 @@ export function App() {
     sort,
     limit: 24,
   });
+
+  const pendingReconnectRefetchRef = useRef(false);
+
+  // Guarded & deferred offline recovery refetch
+  // When coming back online, sets pending flag; refetches as soon as all in-flight mutations and loads finish
+  useEffect(() => {
+    if (!wasOnlineRef.current && isOnline) {
+      pendingReconnectRefetchRef.current = true;
+    }
+    wasOnlineRef.current = isOnline;
+
+    if (pendingReconnectRefetchRef.current && isOnline) {
+      const canSafelyRefetch =
+        !isApplyingBulk &&
+        !isSavingDetail &&
+        !loading &&
+        !loadingMore;
+
+      if (canSafelyRefetch) {
+        pendingReconnectRefetchRef.current = false;
+        refetch();
+      }
+    }
+  }, [isOnline, isApplyingBulk, isSavingDetail, loading, loadingMore, refetch]);
 
   const itemsRef = useRef<Asset[]>(items);
   itemsRef.current = items;
@@ -105,32 +161,21 @@ export function App() {
   }, [debouncedQ, status, kind, tag]);
 
   const toggleSelect = useCallback((id: string, isShift?: boolean) => {
-    const currentItems = itemsRef.current;
+    const lastId = lastSelectedIdRef.current;
     const prev = selectedIdsRef.current;
-    const next = new Set<string>(prev);
 
-    if (isShift && lastSelectedIdRef.current) {
-      const lastIndex = currentItems.findIndex((a: Asset) => a.id === lastSelectedIdRef.current);
-      const currentIndex = currentItems.findIndex((a: Asset) => a.id === id);
-
-      if (lastIndex !== -1 && currentIndex !== -1) {
-        const [start, end] =
-          lastIndex < currentIndex ? [lastIndex, currentIndex] : [currentIndex, lastIndex];
-        for (let i = start; i <= end; i++) {
-          const item = currentItems[i];
-          if (item) next.add(item.id);
-        }
-        lastSelectedIdRef.current = id;
-        selectedIdsRef.current = next;
-        setSelectedIds(next);
-        return;
-      }
+    let next: Set<string> | null = null;
+    if (isShift && lastId) {
+      next = computeRangeSelection(itemsRef.current, lastId, id, prev);
     }
 
-    if (next.has(id)) {
-      next.delete(id);
-    } else {
-      next.add(id);
+    if (!next) {
+      next = new Set(prev);
+      if (next.has(id)) {
+        next.delete(id);
+      } else {
+        next.add(id);
+      }
     }
 
     lastSelectedIdRef.current = id;
@@ -217,8 +262,13 @@ export function App() {
     }
   }
 
+  const gridResetKey = `${debouncedQ}:${sort}:${status.join(',')}:${kind.join(',')}:${tag.join(',')}`;
+
   return (
     <div className="app">
+      {/* Root-level offline banner outside all panel error boundaries */}
+      <OfflineBanner />
+
       <header className="topbar">
         <h1>MediaVault</h1>
         <input
@@ -315,28 +365,44 @@ export function App() {
         </div>
       )}
 
-      {error && <p className="error">{error}</p>}
-
       <main className="content">
-        <AssetGrid
-          assets={items}
-          loading={loading}
-          loadingMore={loadingMore}
-          error={error}
-          loadMoreError={loadMoreError}
-          hasMore={hasMore}
-          selectedIds={selectedIds}
-          activeId={activeId}
-          onToggleSelect={toggleSelect}
-          onOpen={setActiveId}
-          onLoadMore={loadMore}
-        />
-        {activeId && (
-          <AssetDetail
-            id={activeId}
-            onClose={() => setActiveId(null)}
-            onAssetChanged={updateAssetItem}
+        <PanelBoundary
+          name="Asset Grid"
+          resetKey={gridResetKey}
+          onRetry={refetch}
+        >
+          <AssetGrid
+            assets={items}
+            loading={loading}
+            loadingMore={loadingMore}
+            error={error}
+            loadMoreError={loadMoreError}
+            hasMore={hasMore}
+            selectedIds={selectedIds}
+            activeId={activeId}
+            onToggleSelect={toggleSelect}
+            onOpen={setActiveId}
+            onLoadMore={loadMore}
           />
+        </PanelBoundary>
+
+        {activeId && (
+          <PanelBoundary
+            name="Asset Detail"
+            resetKey={activeId}
+            onRetry={() => {
+              const current = activeId;
+              setActiveId(null);
+              setTimeout(() => setActiveId(current), 0);
+            }}
+          >
+            <AssetDetail
+              id={activeId}
+              onClose={() => setActiveId(null)}
+              onAssetChanged={updateAssetItem}
+              onSavingChange={setIsSavingDetail}
+            />
+          </PanelBoundary>
         )}
       </main>
     </div>

@@ -33,6 +33,10 @@ Roughly, and how you split it.
 | 5 | `AssetGrid` unconditionally showed "Nothing matches these filters" on `assets.length === 0`, causing empty state flashes during loading and masking error states | `AssetGrid.tsx`, `App.tsx` | Fixed |
 | 6 | Unvirtualized asset grid mounted all loaded DOM elements continuously, causing unbounded DOM size (5,000+ nodes) and severe scroll jank at scale | `AssetGrid.tsx` | Fixed |
 | 7 | Missing thumbnails (`hasThumbnail: false` or 404 responses) showed broken image icons and caused Cumulative Layout Shift (CLS) as pages loaded | `AssetGrid.tsx`, `styles.css` | Fixed |
+| 8 | Transient failures (`503`, `429`, network drops) had no retry loop, exponential backoff, or `Retry-After` handling, causing immediate failures under hostile network conditions | `client.ts` | Fixed |
+| 9 | Leaked raw technical backend messages (e.g. `429: Too many requests...`) into the UI without user-actionable explanations | `App.tsx`, `AssetDetail.tsx` | Fixed |
+| 10 | Retried mutations on network drop caused phantom `409 Conflict` errors when server applied the change before dropping response | `client.ts`, `AssetDetail.tsx` | Fixed |
+| 11 | No React Error Boundaries — a component-level rendering failure crashed and blanked the entire application | `App.tsx` | Fixed |
 
 ---
 
@@ -59,12 +63,22 @@ six of these is about right.
 - **Selection model:** Built using `Set<string>` for O(1) membership checks. Supports click toggling, Shift-click range selection from the last-clicked anchor ID (surviving re-sorts), "Select all loaded", and "Clear selection". Selection resets on search/filter query identity changes, but is preserved across sort order changes.
 - **Snapshot-based Optimistic Update & Rollback:** `useAssets.applyBulkStatus` captures an immutable pre-action status snapshot of targeted IDs from `itemsRef.current`, applies the new status to local React state immediately, and delegates network execution. On completion, only `failed` and `unknown` items are rolled back to their snapshot value; `succeeded` IDs keep their new status and reconcile server version metadata (`appliedAssets`).
 - **Chunking with Bounded Concurrency:** `bulkSetStatus` splits large selections into ≤ 50-item batches and runs them through `mapConcurrent` with a concurrency ceiling of 3 workers. Network-level HTTP chunk errors are isolated: a failing chunk contributes only its own batch to `unknown`, while other successful chunks report per-item results.
-- **Three-way Result Partitioning & Smart Recovery:** Each bulk operation yields `{ succeeded, failed, unknown, appliedAssets }`. Successful items are deselected immediately. `failed` carries an item-level error `code` and `retryable` boolean. "Retry N items" re-sends only the retryable subset (`conflict`, `unknown`); permanent failures (`legal_hold`, `not_found`) cannot succeed and are excluded from the count (e.g. if 96 items are selected and 21 fail with 13 on legal hold, the button prompts "Retry 8 items", not 21 failed, not 96 selected).
-- **Single-Asset 409 Conflict Strategy in `AssetDetail`:** Catches `ApiError` structurally (status `409`), refetches the latest server asset, and renders a conflict banner with two clear choices: *Reload latest* (discard local edit, adopt server state) or *Overwrite* (re-apply edit with latest version). Chosen over auto-merge (silently resolves conflicts on user-owned metadata) and auto-reload (discards the reviewer's edit without asking). Accepted cost: 1 extra `getAsset` round-trip and 1 explicit user click.
+- **Three-way Result Partitioning & Smart Recovery:** Each bulk operation yields `{ succeeded, failed, unknown, appliedAssets }`. Successful items are deselected immediately. `failed` carries an item-level error `code` and `retryable` boolean. "Retry N items" re-sends only the retryable subset (`conflict`, `unknown`); permanent failures (`legal_hold`, `not_found`) cannot succeed and are excluded from the count.
+- **Single-Asset 409 Conflict Strategy in `AssetDetail`:** Catches `ApiError` structurally (status `409`), refetches the latest server asset, and renders a conflict banner with two clear choices: *Reload latest* (discard local edit, adopt server state) or *Overwrite* (re-apply edit with latest version).
 
-**State placement and URL sync**
-- Initialized state from URL query parameters via `getInitialParams()` on mount (`q`, `status`, `kind`, `tag`, `sort`).
-- Used `window.history.replaceState` synchronized with the debounced query state so that active views are shareable, deep-linkable, and persist across page refreshes without cluttering the browser history with an entry for every keystroke.
+**Resilience, Retries, and Error Boundaries (Task 4)**
+- **Two-Layer Retry Gating:** Retries require two independent gates to pass: `options.retryable: boolean` (endpoint policy) and `classifyError(err).retryable: boolean` (structural error classification). This guarantees that mutations never retry accidentally unless the call site explicitly opts in.
+- **Safe-by-Default (`retryable: false`):** `requestWithRetry` defaults `retryable` to `false`. Read endpoints (`listAssets`, `getAsset`, `getAssetsByIds`) and OCC-protected endpoints explicitly opt in with `true`.
+- **Pure Structural Error Classifier:** `classifyError` classifies errors purely on properties (`status`, `name`, `code`) without regex or string matching. `503`, `429`, `500`, network drops (`TypeError`), and unclassified errors default to transient/retryable; `400`, `409`, `422`, and `AbortError` are strictly non-retryable.
+- **Wall-Clock Cooldown Synchronization (`Date.now()`):** `rateLimitUntil` stores an absolute timestamp updated via `Math.max`. We chose wall-clock `Date.now()` over monotonic `performance.now()` because it directly coordinates with HTTP `Retry-After` epoch offsets and remains consistent across environments. Cooldown waits do not burn retry attempts, and abort signals reject cooldown waits immediately.
+- **Phantom-409 OCC Reconciliation in `updateAsset`:** When a retried `PATCH` (`attempt > 0`) receives `409 Conflict` (due to a lost response on an initial write that actually committed), `updateAsset` refetches the asset and performs per-field equality verification. If all patch fields match, it reconciles as success; if unmatched, it surfaces the genuine conflict; if the verification refetch fails, it surfaces an `unconfirmed` error state.
+- **Panel-Scoped Error Boundaries (`PanelBoundary`):** Wrapped `AssetGrid` and `AssetDetail` in isolated boundaries with dynamic `resetKeys` (`queryKey` for grid, `activeId` for detail). A rendering crash in one panel never blanks the other, and users can reload individual panels without losing application state.
+- **Guarded Offline Recovery:** Root-level `OfflineBanner` with `aria-live="polite"` announces connectivity changes. When reconnecting, active query refetch is guarded on `!isApplyingBulk && !isSavingDetail && !loading && !loadingMore` to prevent clobbering optimistic writes and duplicate fetches.
+- **Offline detection trigger:** `reportNetworkFailure()` fires on any terminal retryable-class failure — an exhausted 5xx, an exhausted 429, or a TypeError network drop — not just `navigator.onLine === false`. This matters for a hostile API that fails server-side, not just network-side.
+- **`unconfirmed` UX:** When the phantom-409 reconciliation refetch fails, `updateAsset` throws `ApiError` with `unconfirmed: true` and status `0`. `AssetDetail` renders: *"Network dropped during save; write outcome is unconfirmed. Reload asset to verify."* with a "Reload asset to verify" button.
+- **`unconfirmed` ↔ `unknown`:** `unconfirmed` (single-asset) and Task 3's `unknown` bucket (bulk chunk) are the same concept at different granularities: "the write may or may not have landed." They share a shape but not a recovery path — Task 3 retries, Task 4 reloads to verify.
+- **Deferred refetch:** When the reconnect refetch guard (`!isApplyingBulk && !isSavingDetail && !loading && !loadingMore`) blocks, the refetch is deferred, not dropped. A `pendingReconnectRefetchRef` flag fires it as soon as in-flight work settles. Verified in UI: reconnect → ~1s loading → grid populates.
+- **Test evidence:** Task 4's classifier and retry loop are covered by 23 unit tests in `src/api/errorClassifier.test.ts` and `src/api/retry.test.ts`, runnable via `npm test`. Tests verify structural classification (two tests prove the classifier doesn't read error message strings), backoff bounds, retry-gate behavior, non-burning cooldown, abort-mid-backoff, and retry cap.
 
 ---
 
@@ -89,7 +103,7 @@ Fill in real measurements, not estimates. Say which machine and browser (e.g., m
 | Metric | Measured Value | How measured |
 | --- | --- | --- |
 | Rendered DOM nodes at 5,040 assets loaded | 48 `.card` nodes; 445 total DOM elements | `document.querySelectorAll('.card').length` and `document.querySelectorAll('*').length` in Chrome DevTools Console |
-| Production bundle, gzipped | 61.45 kB total (59.92 kB JS + 1.53 kB CSS) | `npm run build` Vite production build output |
+| Production bundle, gzipped | 64.42 kB total (62.65 kB JS + 1.77 kB CSS) | `npm run build` Vite production build output |
 
 What was the actual bottleneck, and how did you find it?
 - **1. Unvirtualized DOM Bloat (Task 2)**: Without virtualization, loading subsequent pages mounted every asset directly to the DOM, causing unbounded DOM size as the library scaled. Identified using Chrome DevTools Console and `document.querySelectorAll('.card').length`. Resolved by implementing dynamic 2D row virtualization with `@tanstack/react-virtual` and `ResizeObserver`, bounding the DOM to 48 card nodes / 445 total DOM elements at 5,040 assets loaded.
@@ -116,7 +130,7 @@ follow from it. Then briefly:
   stay distinguishable without relying on colour.
 - **States.** Distinct loading, empty, and error states in `AssetGrid`. Uncoupled empty filter results from loading and error states to prevent flashes of "No results found" before data lands.
 - **Contrast.** What you checked against, and with what.
-- **Copy.** Any user-facing message you rewrote and why.
+- **Copy.** User-facing messages rewritten through `getActionableErrorMessage`: translated technical codes (`429`, `503`, network drops) into clear, context-specific messages (e.g. "Server is busy. Automatically updating search results in a moment…") rather than leaking implementation details.
 
 Screenshots in the repo are welcome — link them here.
 
@@ -125,11 +139,12 @@ Screenshots in the repo are welcome — link them here.
 ## Trade-offs and cuts
 
 - **Debounce placement (`App.tsx` vs `useAssets.ts`)**: We debounced only the search input in `App.tsx` instead of delaying the entire `useAssets` hook. This way, clicking a filter checkbox or changing the sort dropdown updates the screen instantly, while typing still waits 300ms so we don't spam the server on every keystroke.
-- **De-duplication limited to signal-less GETs**: The request layer de-duplicates only `GET` requests that have no `AbortSignal` attached. Signal-bearing GETs — which is what `listAssets` in `useAssets` always sends, to support query-change cancellation — bypass de-duplication and each perform their own fetch. The trade-off is that the most-used endpoint gets no de-dup coverage, but per-caller cancellation works correctly. Sharing a promise between signal-bearing callers was rejected because aborting one caller's request would reject the others, which breaks the cancellation contract that Task 1 requires.
+- **De-duplication limited to signal-less GETs**: The request layer de-duplicates only `GET` requests that have no `AbortSignal` attached. Signal-bearing GETs — which is what `listAssets` in `useAssets` always sends, to support query-change cancellation — bypass de-duplication and each perform their own fetch.
 - **Row-based 2D Virtualization**: Grouped items into dynamic row slices rather than maintaining an uncoordinated 2D grid matrix. Responsive column count is computed continuously by a `ResizeObserver`, keeping the virtualizer 1D and efficient while rendering a true responsive multi-column CSS grid.
-- **Explicit 409 Conflict Resolution over Auto-Merge**: In `AssetDetail`, we prompt the user to *Reload latest* or *Overwrite* rather than attempting heuristic auto-merging. Auto-merging silently resolves concurrent edits on user-owned metadata, risking data loss. The explicit choice requires an extra `getAsset` round-trip and user click, but prevents silent state corruption.
-- **ID-scoped Bulk Updates across Query Shifts**: Bulk status changes operate strictly on captured target IDs rather than live query boundaries. If the user shifts search/filter criteria while a bulk mutation is in flight, the operation finishes in the background, reporting accurate results without corrupting the newly loaded query items (guarded by `generationRef`). Global rate limiting across the bulk pool and read path is deferred to Task 4.
-- **Batch query parameter ordering**: `getAssetsByIds(['a', 'b'])` and `getAssetsByIds(['b', 'a'])` produce different URLs and are treated as distinct request keys. Normalizing ID order before generating cache keys was deferred as a minor edge case.
+- **Explicit 409 Conflict Resolution over Auto-Merge**: In `AssetDetail`, we prompt the user to *Reload latest* or *Overwrite* rather than attempting heuristic auto-merging. Auto-merging silently resolves concurrent edits on user-owned metadata, risking data loss.
+- **Rejection of Client-Side Token Bucket**: Rejected building an in-memory token bucket for the 80/10s rate limit window. Driven by `Retry-After: 3`, a single module-level `rateLimitUntil` wall-clock timestamp awaited by all requests is deterministic, zero-overhead, and immune to multi-tab drift.
+- **No Offline Mutating Write Queueing**: Rejected queueing and auto-replaying mutating status writes when offline. In a multi-user asset review platform, silently replaying stale writes 20 seconds later risks overwriting concurrent decisions made by other reviewers.
+- **ID-scoped Bulk Updates across Query Shifts**: Bulk status changes operate strictly on captured target IDs rather than live query boundaries. If the user shifts search/filter criteria while a bulk mutation is in flight, the operation finishes in the background, reporting accurate results without corrupting the newly loaded query items (guarded by `generationRef`).
 
 What you deliberately did not do, and what you would do with another day.
 

@@ -7,20 +7,10 @@ import type {
   BulkExecutionResult,
   BulkItemFailure,
 } from '@/lib/types';
+import { ApiError } from './errorClassifier';
+import { requestWithRetry } from './retry';
 
-export class ApiError extends Error {
-  readonly status: number;
-  readonly code?: string;
-  readonly retryAfterMs?: number;
-
-  constructor(message: string, status: number, code?: string, retryAfterMs?: number) {
-    super(message);
-    this.name = 'ApiError';
-    this.status = status;
-    this.code = code;
-    this.retryAfterMs = retryAfterMs;
-  }
-}
+export { ApiError } from './errorClassifier';
 
 const inFlight = new Map<string, Promise<unknown>>();
 
@@ -54,28 +44,50 @@ function toSearchParams(query: AssetQuery): string {
   return params.toString();
 }
 
-async function request<T>(path: string, init?: RequestInit): Promise<T> {
-  const performFetch = async () => {
-    const res = await fetch(path, {
-      ...init,
-      headers: { 'content-type': 'application/json', ...(init?.headers ?? {}) },
-    });
-    if (!res.ok) {
-      let detail = res.statusText;
-      let code: string | undefined;
-      try {
-        const body = await res.json();
-        detail = body?.error?.message ?? body?.message ?? detail;
-        code = body?.error?.code ?? body?.code;
-      } catch {
-        /* response was not JSON */
-      }
-      const retryAfterHeader = res.headers.get('retry-after');
-      const retryAfterMs = retryAfterHeader ? Number.parseInt(retryAfterHeader, 10) * 1000 : undefined;
-      throw new ApiError(detail, res.status, code, retryAfterMs);
+/**
+ * Low-level HTTP fetch with error parsing.
+ */
+async function rawFetch<T>(path: string, init?: RequestInit): Promise<T> {
+  const res = await fetch(path, {
+    ...init,
+    headers: { 'content-type': 'application/json', ...(init?.headers ?? {}) },
+  });
+
+  if (!res.ok) {
+    let detail = res.statusText;
+    let code: string | undefined;
+    try {
+      const body = await res.json();
+      detail = body?.error?.message ?? body?.message ?? detail;
+      code = body?.error?.code ?? body?.code;
+    } catch {
+      /* response was not JSON */
     }
-    return res.json() as Promise<T>;
-  };
+    const retryAfterHeader = res.headers.get('retry-after');
+    const retryAfterMs = retryAfterHeader ? Number.parseInt(retryAfterHeader, 10) * 1000 : undefined;
+    throw new ApiError(detail, res.status, code, retryAfterMs);
+  }
+
+  return res.json() as Promise<T>;
+}
+
+/**
+ * Standard request wrapper with retry policies and deduplication.
+ */
+async function request<T>(
+  path: string,
+  init?: RequestInit,
+  options?: { retryable?: boolean; maxRetries?: number },
+): Promise<T> {
+  const performFetch = () =>
+    requestWithRetry(
+      () => rawFetch<T>(path, init),
+      {
+        retryable: options?.retryable ?? false,
+        maxRetries: options?.maxRetries,
+        signal: init?.signal ?? undefined,
+      },
+    );
 
   const key = requestKey(path, init);
   if (key && !init?.signal) {
@@ -85,13 +97,15 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 }
 
 export function listAssets(query: AssetQuery, signal?: AbortSignal): Promise<AssetPage> {
-  return request<AssetPage>(`/api/assets?${toSearchParams(query)}`, {
-    signal,
-  });
+  return request<AssetPage>(
+    `/api/assets?${toSearchParams(query)}`,
+    { signal },
+    { retryable: true },
+  );
 }
 
 export function getAsset(id: string): Promise<Asset> {
-  return request<Asset>(`/api/assets/${id}`);
+  return request<Asset>(`/api/assets/${id}`, undefined, { retryable: true });
 }
 
 function chunk<T>(items: T[], size: number): T[][] {
@@ -123,7 +137,11 @@ export async function getAssetsByIds(ids: string[]): Promise<{ items: Asset[]; m
   if (ids.length === 0) return { items: [], missing: [] };
   const chunks = chunk(ids, 25);
   const chunkResults = await mapConcurrent(chunks, 3, (batchIds) =>
-    request<{ items: Asset[]; missing: string[] }>(`/api/assets/batch?ids=${batchIds.join(',')}`),
+    request<{ items: Asset[]; missing: string[] }>(
+      `/api/assets/batch?ids=${batchIds.join(',')}`,
+      undefined,
+      { retryable: true },
+    ),
   );
 
   const items: Asset[] = [];
@@ -135,15 +153,83 @@ export async function getAssetsByIds(ids: string[]): Promise<{ items: Asset[]; m
   return { items, missing };
 }
 
-export function updateAsset(
+/**
+ * Checks per-field equality for every key in the patch object against the server asset.
+ */
+function isPatchApplied(
+  serverAsset: Asset,
+  patch: Partial<Pick<Asset, 'name' | 'status' | 'tags'>>,
+): boolean {
+  const patchKeys = Object.keys(patch) as Array<keyof typeof patch>;
+  if (patchKeys.length === 0) return true;
+
+  for (const key of patchKeys) {
+    if (key === 'tags') {
+      const patchTags = patch.tags;
+      const serverTags = serverAsset.tags;
+      if (!Array.isArray(patchTags) || !Array.isArray(serverTags)) return false;
+      if (patchTags.length !== serverTags.length) return false;
+      if (!patchTags.every((t, i) => t === serverTags[i])) return false;
+    } else {
+      if (serverAsset[key] !== patch[key]) {
+        return false;
+      }
+    }
+  }
+  return true;
+}
+
+/**
+ * Updates a single asset with optimistic concurrency control (OCC).
+ *
+ * Resilience Strategy (Phantom-409 Reconciliation):
+ * Retries are safe because the endpoint enforces a strict version check.
+ * If an earlier attempt (attempt > 0) successfully committed to the DB but the network dropped
+ * before returning 200 (causing the server to respond with 409 Conflict on retry), we refetch
+ * the asset and check if all patch fields match.
+ *
+ * If matched: reconciles and returns as success.
+ * If unmatched: surfaces legitimate 409 version conflict.
+ * If verification refetch fails: throws ApiError with unconfirmed: true (status 0).
+ */
+export async function updateAsset(
   id: string,
   version: number,
   patch: Partial<Pick<Asset, 'name' | 'status' | 'tags'>>,
 ): Promise<Asset> {
-  return request<Asset>(`/api/assets/${id}`, {
-    method: 'PATCH',
-    body: JSON.stringify({ version, patch }),
-  });
+  return requestWithRetry(
+    async (attempt: number) => {
+      try {
+        return await rawFetch<Asset>(`/api/assets/${id}`, {
+          method: 'PATCH',
+          body: JSON.stringify({ version, patch }),
+        });
+      } catch (err: unknown) {
+        // Trigger phantom-409 reconciliation on ANY 409 occurring on a retried attempt (attempt > 0)
+        if (err instanceof ApiError && err.status === 409 && attempt > 0) {
+          try {
+            // Refetch current server state to verify if our previous write actually landed
+            const latest = await rawFetch<Asset>(`/api/assets/${id}`);
+            if (isPatchApplied(latest, patch)) {
+              // Reconciled: our write succeeded on the server before the network dropped!
+              return latest;
+            }
+          } catch {
+            // Verification refetch failed — surface unconfirmed state so the caller knows outcome is unknown
+            throw new ApiError(
+              'Write outcome unconfirmed due to connection loss during verification',
+              0,
+              'write_unconfirmed',
+              undefined,
+              true,
+            );
+          }
+        }
+        throw err;
+      }
+    },
+    { retryable: true },
+  );
 }
 
 export async function bulkSetStatus(
